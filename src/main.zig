@@ -1,13 +1,6 @@
 const std = @import("std");
 const zrep = @import("zrep");
-
-const Options = struct {
-    ignore_case: bool = false,
-    line_numbers: bool = false,
-    invert: bool = false,
-    count: bool = false,
-    recursive: bool = false,
-};
+const print = std.debug.print;
 
 pub fn searchStreamPrintMatch(r: *std.Io.Reader, w: std.Io.File, io: std.Io, path: []const u8, pattern: []const u8) !void {
     var line_num: usize = 0;
@@ -36,8 +29,8 @@ pub fn openFileAndSearch(io: std.Io, item: []const u8, pattern: []const u8) !voi
 
     const file = std.Io.Dir.cwd().openFile(io, item, .{ .mode = .read_only }) catch |err| {
         switch (err) {
-            error.FileNotFound => std.debug.print("{s}: no such file\n", .{item}),
-            else => std.debug.print("{s}: {s}\n", .{ item, @errorName(err) }),
+            error.FileNotFound => print("{s}: no such file\n", .{item}),
+            else => print("{s}: {s}\n", .{ item, @errorName(err) }),
         }
         return;
     };
@@ -59,7 +52,7 @@ pub fn main(init: std.process.Init) !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var options: Options = .{};
+    var options: zrep.Options = .{};
     var pattern: ?[]const u8 = null;
 
     const args = try init.minimal.args.toSlice(allocator);
@@ -100,9 +93,10 @@ pub fn main(init: std.process.Init) !void {
     for (paths.items) |item| {
         openFileAndSearch(io, item, pat) catch |err| {
             switch (err) {
+                // TODO: statFile to determine if dir and handle appropriately
                 error.ReadFailed => {
                     if (options.recursive == false) {
-                        std.debug.print("{s} is not a file. Read failed. Use flag -r to recursively search directories\n", .{item});
+                        print("{s} is not a file. Read failed. Use flag -r to recursively search directories\n", .{item});
                     } else {
                         // TODO: handle errors better?
                         // check if dir
@@ -122,7 +116,7 @@ pub fn main(init: std.process.Init) !void {
                         }
                     }
                 },
-                else => std.debug.print("{s}: {s}\n", .{ item, @errorName(err) }),
+                else => print("{s}: {s}\n", .{ item, @errorName(err) }),
             }
             continue;
         };
