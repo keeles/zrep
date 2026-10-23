@@ -2,29 +2,8 @@ const std = @import("std");
 const zrep = @import("zrep");
 const print = std.debug.print;
 
-pub fn searchStreamPrintMatch(r: *std.Io.Reader, w: std.Io.File, io: std.Io, path: []const u8, pattern: []const u8) !void {
-    var line_num: usize = 0;
-    var printed_header = false;
-
-    while (try r.takeDelimiter('\n')) |line| {
-        line_num += 1;
-        if (std.mem.indexOf(u8, line, pattern) == null) continue;
-
-        if (!printed_header) {
-            try w.writeStreamingAll(io, "\n");
-            try w.writeStreamingAll(io, path);
-            try w.writeStreamingAll(io, "\n");
-            printed_header = true;
-        }
-
-        var out: [64 * 1024]u8 = undefined;
-        const str = try std.fmt.bufPrint(&out, "{d}:{s}\n", .{ line_num, line });
-        try w.writeStreamingAll(io, str);
-    }
-}
-
 // TODO: need to handle check if dir => return err; OR if recursive flag walk dir
-pub fn openFileAndSearch(io: std.Io, item: []const u8, pattern: []const u8) !void {
+pub fn openFileAndSearch(io: std.Io, item: []const u8, pattern: []const u8, opts: zrep.Options) !void {
     const stdout = std.Io.File.stdout();
 
     const file = std.Io.Dir.cwd().openFile(io, item, .{ .mode = .read_only }) catch |err| {
@@ -40,7 +19,7 @@ pub fn openFileAndSearch(io: std.Io, item: []const u8, pattern: []const u8) !voi
     var reader = file.readerStreaming(io, &buffer);
     const r = &reader.interface;
 
-    try searchStreamPrintMatch(r, stdout, io, item, pattern);
+    try zrep.searchStream(r, stdout, io, item, pattern, opts);
     return;
 }
 
@@ -91,7 +70,7 @@ pub fn main(init: std.process.Init) !void {
 
     // find matches
     for (paths.items) |item| {
-        openFileAndSearch(io, item, pat) catch |err| {
+        openFileAndSearch(io, item, pat, options) catch |err| {
             switch (err) {
                 // TODO: statFile to determine if dir and handle appropriately
                 error.ReadFailed => {
@@ -111,7 +90,7 @@ pub fn main(init: std.process.Init) !void {
                                 const pathToFile = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ item, entry.path });
                                 defer allocator.free(pathToFile);
 
-                                try openFileAndSearch(io, pathToFile, pat);
+                                try openFileAndSearch(io, pathToFile, pat, options);
                             }
                         }
                     }

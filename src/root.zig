@@ -11,7 +11,7 @@ pub const Options = struct {
 /// Pure logic: no I/O, trivially testable. Grows as you add flags.
 pub fn lineMatches(line: []const u8, pattern: []const u8, opts: Options) bool {
     const found = if (opts.ignore_case)
-        std.ascii.indexOfIgnoreCase(line, pattern) != null
+        std.ascii.findIgnoreCasePos(line, 0, pattern) != null
     else
         std.mem.indexOf(u8, line, pattern) != null;
     return found != opts.invert;
@@ -25,7 +25,7 @@ pub fn searchStream(
     path: []const u8,
     pattern: []const u8,
     opts: Options,
-) !bool {
+) !void {
     var line_num: usize = 0;
     var printed_header = false;
 
@@ -47,7 +47,6 @@ pub fn searchStream(
             try std.fmt.bufPrint(&out, "{s}\n", .{line});
         try w.writeStreamingAll(io, str);
     }
-    return printed_header;
 }
 
 test "lineMatches: literal, ignore case, invert" {
