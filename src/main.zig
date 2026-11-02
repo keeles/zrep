@@ -2,30 +2,56 @@ const std = @import("std");
 const zrep = @import("zrep");
 const print = std.debug.print;
 
-// TODO: need to handle check if dir => return err; OR if recursive flag walk dir
-pub fn openFileAndSearch(io: std.Io, item: []const u8, pattern: []const u8, opts: zrep.Options) !void {
-    const stdout = std.Io.File.stdout();
-
-    const file = std.Io.Dir.cwd().openFile(io, item, .{ .mode = .read_only }) catch |err| {
-        switch (err) {
-            error.FileNotFound => print("{s}: no such file\n", .{item}),
-            else => print("{s}: {s}\n", .{ item, @errorName(err) }),
-        }
-        return;
-    };
-    defer file.close(io);
-
+pub fn searchFile(
+    io: std.Io,
+    stdout: std.Io.File,
+    file: std.Io.File,
+    item: []const u8,
+    pattern: []const u8,
+    opts: zrep.Options,
+) !void {
     var buffer: [64 * 1024]u8 = undefined;
     var reader = file.readerStreaming(io, &buffer);
     const r = &reader.interface;
 
-    try zrep.searchStream(r, stdout, io, item, pattern, opts);
+    _ = try zrep.searchStream(r, stdout, io, item, pattern, opts);
     return;
 }
 
+pub fn walkDir(
+    io: std.Io,
+    stdout: std.Io.File,
+    allocator: std.mem.Allocator,
+    directory: []const u8,
+    pattern: []const u8,
+    options: zrep.Options,
+) !void {
+    const dir = try std.Io.Dir.cwd().openDir(io, directory, .{ .iterate = true });
+    defer dir.close(io);
+
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+
+    while (try walker.next(io)) |entry| {
+        // skip symlinks, sockets, etc.
+        if (entry.kind != .file) continue;
+
+        const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ directory, entry.path });
+        defer allocator.free(full_path);
+
+        const file = dir.openFile(io, entry.path, .{ .mode = .read_only }) catch |err| {
+            print("zrep: {s}: {s}\n", .{ full_path, @errorName(err) });
+            continue;
+        };
+        defer file.close(io);
+
+        try searchFile(io, stdout, file, full_path, pattern, options);
+    }
+}
 // hello -> comment is for testing do not remove
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
+    const stdout = std.Io.File.stdout();
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -65,39 +91,36 @@ pub fn main(init: std.process.Init) !void {
             try paths.append(allocator, arg);
         }
     }
+    options.show_filenames = paths.items.len > 1 or options.recursive;
 
     const pat = pattern orelse return error.InvalidArguments;
 
     // find matches
     for (paths.items) |item| {
-        openFileAndSearch(io, item, pat, options) catch |err| {
+        const file = std.Io.Dir.cwd().openFile(io, item, .{ .mode = .read_only }) catch |err| {
             switch (err) {
-                // TODO: statFile to determine if dir and handle appropriately
-                error.ReadFailed => {
-                    if (options.recursive == false) {
-                        print("{s} is not a file. Read failed. Use flag -r to recursively search directories\n", .{item});
-                    } else {
-                        // TODO: handle errors better?
-                        // check if dir
-                        const dir = try std.Io.Dir.cwd().openDir(io, item, .{ .iterate = true });
-                        defer dir.close(io);
-
-                        var walker = try dir.walk(allocator);
-                        defer walker.deinit();
-
-                        while (try walker.next(io)) |entry| {
-                            if (entry.kind == .file) {
-                                const pathToFile = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ item, entry.path });
-                                defer allocator.free(pathToFile);
-
-                                try openFileAndSearch(io, pathToFile, pat, options);
-                            }
-                        }
-                    }
-                },
+                error.FileNotFound => print("{s}: no such file\n", .{item}),
                 else => print("{s}: {s}\n", .{ item, @errorName(err) }),
             }
-            continue;
+            return;
         };
+        defer file.close(io);
+
+        const meta = try file.stat(io);
+
+        switch (meta.kind) {
+            .file => try searchFile(io, stdout, file, item, pat, options),
+            .directory => {
+                if (!options.recursive) {
+                    print("Error: {s} is not a file. Use -r flag to scan directories\n", .{item});
+                    break;
+                }
+                try walkDir(io, stdout, allocator, item, pat, options);
+            },
+            .sym_link => print("File {s} is symbolic link\n", .{item}),
+            else => {
+                print("{s} is neither file nor directory\n", .{item});
+            },
+        }
     }
 }

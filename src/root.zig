@@ -6,6 +6,7 @@ pub const Options = struct {
     invert: bool = false,
     count: bool = false,
     recursive: bool = false,
+    show_filenames: bool = false,
 };
 
 /// Pure logic: no I/O, trivially testable. Grows as you add flags.
@@ -25,28 +26,45 @@ pub fn searchStream(
     path: []const u8,
     pattern: []const u8,
     opts: Options,
-) !void {
+) !bool {
     var line_num: usize = 0;
     var printed_header = false;
+    var matches: usize = 0;
 
     while (try r.takeDelimiter('\n')) |line| {
         line_num += 1;
         if (!lineMatches(line, pattern, opts)) continue;
 
-        if (!printed_header) {
+        matches += 1;
+
+        if (!opts.count and !printed_header) {
             try w.writeStreamingAll(io, "\n");
             try w.writeStreamingAll(io, path);
             try w.writeStreamingAll(io, "\n");
             printed_header = true;
         }
 
-        var out: [64 * 1024]u8 = undefined;
-        const str = if (opts.line_numbers)
-            try std.fmt.bufPrint(&out, "{d}:{s}\n", .{ line_num, line })
-        else
-            try std.fmt.bufPrint(&out, "{s}\n", .{line});
+        if (!opts.count) {
+            var out: [64 * 1024]u8 = undefined;
+            const str = if (opts.line_numbers)
+                try std.fmt.bufPrint(&out, "{d}:{s}\n", .{ line_num, line })
+            else
+                try std.fmt.bufPrint(&out, "{s}\n", .{line});
+            try w.writeStreamingAll(io, str);
+        }
+    }
+
+    if (opts.count) {
+        if (opts.show_filenames) {
+            try w.writeStreamingAll(io, path);
+            try w.writeStreamingAll(io, ":");
+        }
+        var out: [32]u8 = undefined;
+        const str = try std.fmt.bufPrint(&out, "{d}\n", .{matches});
         try w.writeStreamingAll(io, str);
     }
+
+    return matches > 0;
 }
 
 test "lineMatches: literal, ignore case, invert" {
@@ -75,4 +93,36 @@ test "searchStream prints header and numbered matches" {
 
     try std.testing.expect(matched);
     try std.testing.expectEqualStrings("\nf.txt\n1:alpha\n3:alphabet\n", out.written());
+}
+
+test "searchStream -c prints only the count" {
+    var r = std.Io.Reader.fixed("a\nb\na\n");
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+
+    const matched = try searchStream(&r, TestSink{ .list = &out }, std.testing.io, "f.txt", "a", .{ .count = true });
+
+    try std.testing.expect(matched);
+    try std.testing.expectEqualStrings("2\n", out.written());
+}
+
+test "searchStream -v selects non-matching lines" {
+    var r = std.Io.Reader.fixed("a\nb\na\n");
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+
+    _ = try searchStream(&r, TestSink{ .list = &out }, std.testing.io, "f.txt", "a", .{ .invert = true });
+
+    try std.testing.expectEqualStrings("\nf.txt\nb\n", out.written());
+}
+
+test "searchStream reports no match" {
+    var r = std.Io.Reader.fixed("a\nb\n");
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+
+    const matched = try searchStream(&r, TestSink{ .list = &out }, std.testing.io, "f.txt", "zzz", .{});
+
+    try std.testing.expect(!matched);
+    try std.testing.expectEqualStrings("", out.written());
 }
