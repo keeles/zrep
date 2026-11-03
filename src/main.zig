@@ -49,6 +49,7 @@ pub fn walkDir(
         try searchFile(allocator, io, stdout, file, full_path, pattern, options);
     }
 }
+
 // hello -> comment is for testing do not remove
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -81,7 +82,13 @@ pub fn main(init: std.process.Init) !void {
         if (arg.len > 1 and std.mem.startsWith(u8, arg, "-")) {
             for (arg[1..]) |flag| {
                 switch (flag) {
-                    'c' => options.count = true,
+                    'c' => {
+                        options.count = true;
+
+                        // silently kill context window if count flag detected
+                        options.after_context = 0;
+                        options.before_context = 0;
+                    },
                     'r' => options.recursive = true,
                     'i' => options.ignore_case = true,
                     'l' => options.line_numbers = true,
@@ -93,8 +100,12 @@ pub fn main(init: std.process.Init) !void {
                         }
 
                         const context_size = try std.fmt.parseInt(usize, args[i + 1], 10);
-                        options.after_context = context_size;
                         try param_indexes.put(i + 1, {});
+
+                        // silently kill context window if count flag detected
+                        if (!options.count) {
+                            options.after_context = context_size;
+                        }
                     },
                     'B' => {
                         if (args.len <= (i + 1)) {
@@ -103,8 +114,12 @@ pub fn main(init: std.process.Init) !void {
                         }
 
                         const context_size = try std.fmt.parseInt(usize, args[i + 1], 10);
-                        options.before_context = context_size;
                         try param_indexes.put(i + 1, {});
+
+                        // silently kill context window if count flag detected
+                        if (!options.count) {
+                            options.before_context = context_size;
+                        }
                     },
                     else => {},
                 }

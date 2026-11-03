@@ -20,6 +20,13 @@ pub fn lineMatches(line: []const u8, pattern: []const u8, opts: Options) bool {
     return found != opts.invert;
 }
 
+pub fn write(w: anytype, io: std.Io, str: []const u8, new_line: bool) !void {
+    try w.writeStreamingAll(io, str);
+    if (new_line) {
+        try w.writeStreamingAll(io, "\n");
+    }
+}
+
 /// Writes matching lines to `w` (anything with writeStreamingAll). Returns true if any matched.
 pub fn searchStream(
     allocator: std.mem.Allocator,
@@ -40,6 +47,9 @@ pub fn searchStream(
     var ring_len: usize = 0;
     var ring_start: usize = 0;
 
+    var printed_lines = std.AutoHashMap(usize, void).init(allocator);
+    defer printed_lines.deinit();
+
     const ring = try allocator.alloc(std.ArrayList(u8), opts.before_context);
     defer allocator.free(ring);
 
@@ -57,12 +67,15 @@ pub fn searchStream(
         // print after context
         if (opts.after_context > printed_a_context and matched) {
             printed_a_context += 1;
-            var out: [64 * 1024]u8 = undefined;
-            const str = if (opts.line_numbers)
-                try std.fmt.bufPrint(&out, "{d}:{s}\n", .{ line_num + 1, line })
-            else
-                try std.fmt.bufPrint(&out, "{s}\n", .{line});
-            try w.writeStreamingAll(io, str);
+            if (!printed_lines.contains(line_num + 1)) {
+                var out: [64 * 1024]u8 = undefined;
+                const str = if (opts.line_numbers)
+                    try std.fmt.bufPrint(&out, "{d}:{s}\n", .{ line_num + 1, line })
+                else
+                    try std.fmt.bufPrint(&out, "{s}\n", .{line});
+                try printed_lines.put(line_num + 1, {});
+                try write(w, io, str, false);
+            }
         }
 
         line_num += 1;
@@ -80,50 +93,62 @@ pub fn searchStream(
             }
             continue;
         }
+
         matched = true;
+        printed_a_context = 0;
         matches += 1;
 
         if (!opts.count and !printed_header) {
             // write file name
-            try w.writeStreamingAll(io, path);
-            try w.writeStreamingAll(io, "\n");
+            try write(w, io, path, true);
             printed_header = true;
         }
 
         if (!opts.count) {
+            // print before context
             if (opts.before_context > 0) {
                 var prev_line_count: usize = ring_len;
+
                 for (0..ring_len) |i| {
                     const first_i = (ring_start + i) % opts.before_context;
                     const ring_line = ring[first_i].items;
                     var num: [64 * 1024]u8 = undefined;
+                    const prev_line_num = line_num - prev_line_count;
+                    prev_line_count = prev_line_count -| 1;
+
+                    if (printed_lines.contains(prev_line_num)) continue;
+
                     if (opts.line_numbers) {
-                        const prev_line_num = line_num - prev_line_count;
-                        prev_line_count = prev_line_count -| 1;
                         const str = try std.fmt.bufPrint(&num, "{d}:", .{prev_line_num});
-                        try w.writeStreamingAll(io, str);
+                        try printed_lines.put(prev_line_num, {});
+                        try write(w, io, str, false);
                     }
-                    try w.writeStreamingAll(io, ring_line);
-                    try w.writeStreamingAll(io, "\n");
+
+                    try printed_lines.put(prev_line_num, {});
+                    try write(w, io, ring_line, true);
                 }
             }
-            var out: [64 * 1024]u8 = undefined;
-            const str = if (opts.line_numbers)
-                try std.fmt.bufPrint(&out, "{d}:{s}\n", .{ line_num, line })
-            else
-                try std.fmt.bufPrint(&out, "{s}\n", .{line});
-            try w.writeStreamingAll(io, str);
+
+            if (!printed_lines.contains(line_num)) {
+                var out: [64 * 1024]u8 = undefined;
+                const str = if (opts.line_numbers)
+                    try std.fmt.bufPrint(&out, "{d}:{s}\n", .{ line_num, line })
+                else
+                    try std.fmt.bufPrint(&out, "{s}\n", .{line});
+                try printed_lines.put(line_num, {});
+                try write(w, io, str, false);
+            }
         }
     }
 
     if (opts.count) {
         if (opts.show_filenames) {
-            try w.writeStreamingAll(io, path);
-            try w.writeStreamingAll(io, ":");
+            try write(w, io, path, false);
+            try write(w, io, ":", false);
         }
         var out: [32]u8 = undefined;
         const str = try std.fmt.bufPrint(&out, "{d}\n", .{matches});
-        try w.writeStreamingAll(io, str);
+        try write(w, io, str, false);
     }
 
     return matches > 0;
