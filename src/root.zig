@@ -39,8 +39,14 @@ pub fn searchStream(
 
     var ring_len: usize = 0;
     var ring_start: usize = 0;
+
     const ring = try allocator.alloc(std.ArrayList(u8), opts.before_context);
+    defer allocator.free(ring);
+
     for (ring) |*slot| slot.* = .empty;
+    defer {
+        for (ring) |*slot| slot.deinit(allocator);
+    }
 
     while (try r.takeDelimiter('\n')) |line| {
         if (printed_a_context == opts.after_context) {
@@ -53,7 +59,7 @@ pub fn searchStream(
             printed_a_context += 1;
             var out: [64 * 1024]u8 = undefined;
             const str = if (opts.line_numbers)
-                try std.fmt.bufPrint(&out, "{d}:{s}\n", .{ line_num + printed_a_context, line })
+                try std.fmt.bufPrint(&out, "{d}:{s}\n", .{ line_num + 1, line })
             else
                 try std.fmt.bufPrint(&out, "{s}\n", .{line});
             try w.writeStreamingAll(io, str);
@@ -79,7 +85,6 @@ pub fn searchStream(
 
         if (!opts.count and !printed_header) {
             // write file name
-            try w.writeStreamingAll(io, "\n");
             try w.writeStreamingAll(io, path);
             try w.writeStreamingAll(io, "\n");
             printed_header = true;
@@ -124,8 +129,6 @@ pub fn searchStream(
     return matches > 0;
 }
 
-// TODO: add tests for context flags
-
 test "lineMatches: literal, ignore case, invert" {
     try std.testing.expect(lineMatches("hello world", "world", .{}));
     try std.testing.expect(!lineMatches("hello world", "WORLD", .{}));
@@ -152,7 +155,7 @@ test "searchStream prints header and numbered matches" {
     const matched = try searchStream(allocator, &r, TestSink{ .list = &out }, std.testing.io, "f.txt", "alpha", .{ .line_numbers = true });
 
     try std.testing.expect(matched);
-    try std.testing.expectEqualStrings("\nf.txt\n1:alpha\n3:alphabet\n", out.written());
+    try std.testing.expectEqualStrings("f.txt\n1:alpha\n3:alphabet\n", out.written());
 }
 
 test "searchStream -c prints only the count" {
@@ -175,17 +178,60 @@ test "searchStream -v selects non-matching lines" {
 
     _ = try searchStream(allocator, &r, TestSink{ .list = &out }, std.testing.io, "f.txt", "a", .{ .invert = true });
 
-    try std.testing.expectEqualStrings("\nf.txt\nb\n", out.written());
+    try std.testing.expectEqualStrings("f.txt\nb\n", out.written());
 }
 
 test "searchStream reports no match" {
     const allocator = std.testing.allocator;
     var r = std.Io.Reader.fixed("a\nb\n");
-    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    var out = std.Io.Writer.Allocating.init(allocator);
     defer out.deinit();
 
     const matched = try searchStream(allocator, &r, TestSink{ .list = &out }, std.testing.io, "f.txt", "zzz", .{});
 
     try std.testing.expect(!matched);
     try std.testing.expectEqualStrings("", out.written());
+}
+
+test "searchStream -B stays in bounds" {
+    const allocator = std.testing.allocator;
+    var r = std.Io.Reader.fixed("a\ntest\nb\nc\n");
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+
+    const matched = try searchStream(allocator, &r, TestSink{ .list = &out }, std.testing.io, "f.txt", "test", .{ .before_context = 5 });
+
+    try std.testing.expect(matched);
+    try std.testing.expectEqualStrings("f.txt\na\ntest\n", out.written());
+}
+
+test "searchStream -B overlapping context prints each line once" {
+    const allocator = std.testing.allocator;
+    var r = std.Io.Reader.fixed("a\nhit\nb\nhit\nc\n");
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+
+    const matched = try searchStream(allocator, &r, TestSink{ .list = &out }, std.testing.io, "f.txt", "hit", .{
+        .line_numbers = true,
+        .before_context = 2,
+    });
+
+    try std.testing.expect(matched);
+    try std.testing.expectEqualStrings("f.txt\n1:a\n2:hit\n3:b\n4:hit\n", out.written());
+}
+
+test "test searchStream -B and -A overlapping context prints each line once" {
+    const allocator = std.testing.allocator;
+    var r = std.Io.Reader.fixed("a\nhit\nb\nhit\nhit\nc\nnoshow\n");
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+
+    const matched = try searchStream(allocator, &r, TestSink{ .list = &out }, std.testing.io, "f.txt", "hit", .{
+        .line_numbers = true,
+        .before_context = 2,
+        .after_context = 1,
+    });
+
+    try std.testing.expect(matched);
+    try std.testing.expectEqualStrings("f.txt\n1:a\n2:hit\n3:b\n4:hit\n5:hit\n6:c\n", out.written());
 }
