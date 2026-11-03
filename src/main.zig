@@ -15,6 +15,11 @@ pub fn searchFile(
     var reader = file.readerStreaming(io, &buffer);
     const r = &reader.interface;
 
+    if (opts.count) {
+        _ = try zrep.countMatches(r, stdout, io, item, pattern, opts);
+        return;
+    }
+
     _ = try zrep.searchStream(allocator, r, stdout, io, item, pattern, opts);
     return;
 }
@@ -103,9 +108,7 @@ pub fn main(init: std.process.Init) !void {
                         try param_indexes.put(i + 1, {});
 
                         // silently kill context window if count flag detected
-                        if (!options.count) {
-                            options.after_context = context_size;
-                        }
+                        if (!options.count) options.after_context = context_size;
                     },
                     'B' => {
                         if (args.len <= (i + 1)) {
@@ -117,9 +120,7 @@ pub fn main(init: std.process.Init) !void {
                         try param_indexes.put(i + 1, {});
 
                         // silently kill context window if count flag detected
-                        if (!options.count) {
-                            options.before_context = context_size;
-                        }
+                        if (!options.count) options.before_context = context_size;
                     },
                     else => {},
                 }
