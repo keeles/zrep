@@ -3,6 +3,7 @@ const zrep = @import("zrep");
 const print = std.debug.print;
 
 pub fn searchFile(
+    allocator: std.mem.Allocator,
     io: std.Io,
     stdout: std.Io.File,
     file: std.Io.File,
@@ -14,7 +15,7 @@ pub fn searchFile(
     var reader = file.readerStreaming(io, &buffer);
     const r = &reader.interface;
 
-    _ = try zrep.searchStream(r, stdout, io, item, pattern, opts);
+    _ = try zrep.searchStream(allocator, r, stdout, io, item, pattern, opts);
     return;
 }
 
@@ -45,7 +46,7 @@ pub fn walkDir(
         };
         defer file.close(io);
 
-        try searchFile(io, stdout, file, full_path, pattern, options);
+        try searchFile(allocator, io, stdout, file, full_path, pattern, options);
     }
 }
 // hello -> comment is for testing do not remove
@@ -70,9 +71,13 @@ pub fn main(init: std.process.Init) !void {
     defer directories.deinit(allocator);
 
     var paths: std.ArrayList([]const u8) = .empty;
+    defer paths.deinit(allocator);
+
+    var param_indexes = std.AutoHashMap(usize, void).init(allocator);
+    defer param_indexes.deinit();
 
     // parse args
-    for (args[1..]) |arg| {
+    for (args[1..], 1..) |arg, i| {
         if (arg.len > 1 and std.mem.startsWith(u8, arg, "-")) {
             for (arg[1..]) |flag| {
                 switch (flag) {
@@ -81,9 +86,31 @@ pub fn main(init: std.process.Init) !void {
                     'i' => options.ignore_case = true,
                     'l' => options.line_numbers = true,
                     'v' => options.invert = true,
+                    'A' => {
+                        if (args.len <= (i + 1)) {
+                            print("Missing value for context after flag: -A\n", .{});
+                            return;
+                        }
+
+                        const context_size = try std.fmt.parseInt(usize, args[i + 1], 10);
+                        options.after_context = context_size;
+                        try param_indexes.put(i + 1, {});
+                    },
+                    'B' => {
+                        if (args.len <= (i + 1)) {
+                            print("Missing value for context after flag: -B\n", .{});
+                            return;
+                        }
+
+                        const context_size = try std.fmt.parseInt(usize, args[i + 1], 10);
+                        options.before_context = context_size;
+                        try param_indexes.put(i + 1, {});
+                    },
                     else => {},
                 }
             }
+            continue;
+        } else if (param_indexes.contains(i)) {
             continue;
         } else if (pattern == null) {
             pattern = arg;
@@ -109,7 +136,7 @@ pub fn main(init: std.process.Init) !void {
         const meta = try file.stat(io);
 
         switch (meta.kind) {
-            .file => try searchFile(io, stdout, file, item, pat, options),
+            .file => try searchFile(allocator, io, stdout, file, item, pat, options),
             .directory => {
                 if (!options.recursive) {
                     print("Error: {s} is not a file. Use -r flag to scan directories\n", .{item});
