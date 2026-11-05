@@ -84,55 +84,21 @@ pub fn main(init: std.process.Init) !void {
 
     // parse args
     for (args[1..], 1..) |arg, i| {
-        if (arg.len > 1 and std.mem.startsWith(u8, arg, "-")) {
-            for (arg[1..]) |flag| {
-                switch (flag) {
-                    'c' => {
-                        options.count = true;
-
-                        // silently kill context window if count flag detected
-                        options.after_context = 0;
-                        options.before_context = 0;
-                    },
-                    'r' => options.recursive = true,
-                    'i' => options.ignore_case = true,
-                    'l' => options.line_numbers = true,
-                    'v' => options.invert = true,
-                    'A' => {
-                        if (args.len <= (i + 1)) {
-                            print("Missing value for context after flag: -A\n", .{});
-                            return;
-                        }
-
-                        const context_size = try std.fmt.parseInt(usize, args[i + 1], 10);
-                        try param_indexes.put(i + 1, {});
-
-                        // silently kill context window if count flag detected
-                        if (!options.count) options.after_context = context_size;
-                    },
-                    'B' => {
-                        if (args.len <= (i + 1)) {
-                            print("Missing value for context after flag: -B\n", .{});
-                            return;
-                        }
-
-                        const context_size = try std.fmt.parseInt(usize, args[i + 1], 10);
-                        try param_indexes.put(i + 1, {});
-
-                        // silently kill context window if count flag detected
-                        if (!options.count) options.before_context = context_size;
-                    },
-                    else => {},
-                }
-            }
+        if (param_indexes.contains(i)) {
             continue;
-        } else if (param_indexes.contains(i)) {
-            continue;
-        } else if (pattern == null) {
-            pattern = arg;
-        } else {
-            try paths.append(allocator, arg);
         }
+
+        if (arg.len > 1 and std.mem.startsWith(u8, arg, "-")) {
+            try zrep.parseFlag(args, arg, &param_indexes, i, &options);
+            continue;
+        }
+
+        if (pattern == null) {
+            pattern = arg;
+            continue;
+        }
+
+        try paths.append(allocator, arg);
     }
     options.show_filenames = paths.items.len > 1 or options.recursive;
 

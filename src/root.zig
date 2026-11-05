@@ -1,4 +1,5 @@
 const std = @import("std");
+const print = std.debug.print;
 
 pub const Options = struct {
     ignore_case: bool = false,
@@ -36,6 +37,56 @@ pub const RingBuf = struct {
         self.allocator.free(self.items);
     }
 };
+
+// TODO: add tests for this function
+pub fn parseFlag(
+    args: []const [:0]const u8,
+    arg: [:0]const u8,
+    param_indexes: *std.AutoHashMap(usize, void),
+    i: usize,
+    options: *Options,
+) !void {
+    for (arg[1..]) |flag| {
+        switch (flag) {
+            'c' => {
+                options.count = true;
+
+                // silently kill context window if count flag detected
+                options.after_context = 0;
+                options.before_context = 0;
+            },
+            'r' => options.recursive = true,
+            'i' => options.ignore_case = true,
+            'l' => options.line_numbers = true,
+            'v' => options.invert = true,
+            'A' => {
+                if (args.len <= (i + 1)) {
+                    print("Missing value for context after flag: -A\n", .{});
+                    return;
+                }
+
+                const context_size = try std.fmt.parseInt(usize, args[i + 1], 10);
+                try param_indexes.put(i + 1, {});
+
+                // silently kill context window if count flag detected
+                if (!options.count) options.after_context = context_size;
+            },
+            'B' => {
+                if (args.len <= (i + 1)) {
+                    print("Missing value for context after flag: -B\n", .{});
+                    return;
+                }
+
+                const context_size = try std.fmt.parseInt(usize, args[i + 1], 10);
+                try param_indexes.put(i + 1, {});
+
+                // silently kill context window if count flag detected
+                if (!options.count) options.before_context = context_size;
+            },
+            else => {},
+        }
+    }
+}
 
 /// Pure logic: no I/O, trivially testable.
 pub fn lineMatches(line: []const u8, pattern: []const u8, opts: Options) bool {
