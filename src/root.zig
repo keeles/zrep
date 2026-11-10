@@ -45,7 +45,7 @@ pub fn parseFlag(
     param_indexes: *std.AutoHashMap(usize, void),
     i: usize,
     options: *Options,
-) !void {
+) bool {
     for (arg[1..]) |flag| {
         switch (flag) {
             'c' => {
@@ -62,11 +62,24 @@ pub fn parseFlag(
             'A' => {
                 if (args.len <= (i + 1)) {
                     print("Missing value for context after flag: -A\n", .{});
-                    return;
+                    return false;
                 }
 
-                const context_size = try std.fmt.parseInt(usize, args[i + 1], 10);
-                try param_indexes.put(i + 1, {});
+                const context_size = std.fmt.parseInt(usize, args[i + 1], 10) catch |err| {
+                    print("Error parsing context size integer {s}: ", .{args[i + 1]});
+                    switch (err) {
+                        error.Overflow => print("Integer overflow error\n", .{}),
+                        error.InvalidCharacter => print("Invalid character\n", .{}),
+                    }
+                    return false;
+                };
+                param_indexes.put(i + 1, {}) catch |err| {
+                    print("Error storing buffer context: ", .{});
+                    switch (err) {
+                        error.OutOfMemory => print("Out of memory\n", .{}),
+                    }
+                    return false;
+                };
 
                 // silently kill context window if count flag detected
                 if (!options.count) options.after_context = context_size;
@@ -74,11 +87,24 @@ pub fn parseFlag(
             'B' => {
                 if (args.len <= (i + 1)) {
                     print("Missing value for context after flag: -B\n", .{});
-                    return;
+                    return false;
                 }
 
-                const context_size = try std.fmt.parseInt(usize, args[i + 1], 10);
-                try param_indexes.put(i + 1, {});
+                const context_size = std.fmt.parseInt(usize, args[i + 1], 10) catch |err| {
+                    print("Error parsing context size integer {s}: ", .{args[i + 1]});
+                    switch (err) {
+                        error.Overflow => print("Integer overflow error\n", .{}),
+                        error.InvalidCharacter => print("Invalid character\n", .{}),
+                    }
+                    return false;
+                };
+                param_indexes.put(i + 1, {}) catch |err| {
+                    print("Error storing buffer context: ", .{});
+                    switch (err) {
+                        error.OutOfMemory => print("Out of memory\n", .{}),
+                    }
+                    return false;
+                };
 
                 // silently kill context window if count flag detected
                 if (!options.count) options.before_context = context_size;
@@ -86,6 +112,8 @@ pub fn parseFlag(
             else => {},
         }
     }
+
+    return true;
 }
 
 /// Pure logic: no I/O, trivially testable.
@@ -98,20 +126,26 @@ pub fn lineMatches(line: []const u8, pattern: []const u8, opts: Options) bool {
 }
 
 pub fn write(
-    w: anytype,
-    io: std.Io,
+    w: *std.Io.Writer,
     str: []const u8,
     new_line: bool,
     last_printed_line: usize,
     line_num: usize,
     opts: Options,
-) !usize {
+) usize {
     if ((opts.before_context > 0 or opts.after_context > 0) and line_num <= last_printed_line)
         return last_printed_line;
 
-    try w.writeStreamingAll(io, str);
+    _ = w.writeAll(str) catch |err| {
+        print("Error writing with {s}\n", .{@errorName(err)});
+        return 0;
+    };
+
     if (new_line) {
-        try w.writeStreamingAll(io, "\n");
+        _ = w.writeAll("\n") catch |err| {
+            print("Error writing {s}\n", .{@errorName(err)});
+            return 0;
+        };
     }
 
     return line_num;
@@ -119,8 +153,7 @@ pub fn write(
 
 pub fn countMatches(
     r: *std.Io.Reader,
-    w: anytype,
-    io: std.Io,
+    w: *std.Io.Writer,
     path: []const u8,
     pattern: []const u8,
     opts: Options,
@@ -140,7 +173,10 @@ pub fn countMatches(
     else
         try std.fmt.bufPrint(&out, "{d}\n", .{matches});
 
-    try w.writeStreamingAll(io, str);
+    _ = w.writeAll(str) catch |err| {
+        print("Error: {s}\n", .{@errorName(err)});
+        return false;
+    };
     return matches > 0;
 }
 
@@ -148,8 +184,7 @@ pub fn countMatches(
 pub fn searchStream(
     allocator: std.mem.Allocator,
     r: *std.Io.Reader,
-    w: anytype,
-    io: std.Io,
+    w: *std.Io.Writer,
     path: []const u8,
     pattern: []const u8,
     opts: Options,
@@ -181,7 +216,7 @@ pub fn searchStream(
                 try std.fmt.bufPrint(&out, "{d}:{s}\n", .{ line_num, line })
             else
                 try std.fmt.bufPrint(&out, "{s}\n", .{line});
-            last_printed_line = try write(w, io, str, false, last_printed_line, line_num, opts);
+            last_printed_line = write(w, str, false, last_printed_line, line_num, opts);
         }
 
         if (!lineMatches(line, pattern, opts)) {
@@ -206,7 +241,7 @@ pub fn searchStream(
 
         // write file name
         if (!printed_header) {
-            _ = try write(w, io, path, true, last_printed_line, line_num, opts);
+            _ = write(w, path, true, last_printed_line, line_num, opts);
             printed_header = true;
         }
 
@@ -225,10 +260,10 @@ pub fn searchStream(
 
                 if (opts.line_numbers) {
                     const str = try std.fmt.bufPrint(&num, "{d}:", .{prev_line_num});
-                    _ = try write(w, io, str, false, last_printed_line, prev_line_num, opts);
+                    _ = write(w, str, false, last_printed_line, prev_line_num, opts);
                 }
 
-                _ = try write(w, io, ring_line, true, last_printed_line, prev_line_num, opts);
+                _ = write(w, ring_line, true, last_printed_line, prev_line_num, opts);
             }
         }
 
@@ -238,7 +273,7 @@ pub fn searchStream(
                 try std.fmt.bufPrint(&out, "{d}:{s}\n", .{ line_num, line })
             else
                 try std.fmt.bufPrint(&out, "{s}\n", .{line});
-            last_printed_line = try write(w, io, str, false, last_printed_line, line_num, opts);
+            last_printed_line = write(w, str, false, last_printed_line, line_num, opts);
         }
     }
 

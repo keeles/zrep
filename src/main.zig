@@ -5,44 +5,73 @@ const print = std.debug.print;
 pub fn searchFile(
     allocator: std.mem.Allocator,
     io: std.Io,
-    stdout: std.Io.File,
+    w: *std.Io.Writer,
     file: std.Io.File,
     item: []const u8,
     pattern: []const u8,
     opts: zrep.Options,
-) !void {
+) bool {
+    var match = false;
     var buffer: [64 * 1024]u8 = undefined;
     var reader = file.readerStreaming(io, &buffer);
     const r = &reader.interface;
 
     if (opts.count) {
-        _ = try zrep.countMatches(r, stdout, io, item, pattern, opts);
-        return;
+        match = zrep.countMatches(r, w, item, pattern, opts) catch |err| {
+            print("Error counting matches: {t}\n", .{err});
+            return match;
+        };
+        return match;
     }
 
-    _ = try zrep.searchStream(allocator, r, stdout, io, item, pattern, opts);
-    return;
+    match = zrep.searchStream(allocator, r, w, item, pattern, opts) catch |err| {
+        print("Error searching files: {t}\n", .{err});
+        return match;
+    };
+    return match;
 }
 
 pub fn walkDir(
     io: std.Io,
-    stdout: std.Io.File,
+    w: *std.Io.Writer,
     allocator: std.mem.Allocator,
     directory: []const u8,
     pattern: []const u8,
     options: zrep.Options,
-) !void {
-    const dir = try std.Io.Dir.cwd().openDir(io, directory, .{ .iterate = true });
+) bool {
+    const dir = std.Io.Dir.cwd().openDir(io, directory, .{ .iterate = true }) catch |err| {
+        print("Failed to open directory {s}: ", .{directory});
+        switch (err) {
+            error.AccessDenied => print("Access denied\n", .{}),
+            error.BadPathName => print("Invalid path name\n", .{}),
+            error.FileNotFound => print("Directory not found\n", .{}),
+            error.NotDir => print("Not a directory\n", .{}),
+            error.PermissionDenied => print("Permission denied\n", .{}),
+            error.Unexpected => print("Unexpected\n", .{}),
+            else => print("{t}\n", .{err}),
+        }
+        return false;
+    };
     defer dir.close(io);
+    var any_match = false;
 
-    var walker = try dir.walk(allocator);
+    var walker = dir.walk(allocator) catch |err| {
+        print("Failed to walk directory {s}: ", .{directory});
+        switch (err) {
+            error.OutOfMemory => print("Out of memory\n", .{}),
+        }
+        return false;
+    };
     defer walker.deinit();
 
-    while (try walker.next(io)) |entry| {
+    while (walker.next(io) catch return false) |entry| {
         // skip symlinks, sockets, etc.
         if (entry.kind != .file) continue;
 
-        const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ directory, entry.path });
+        const full_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ directory, entry.path }) catch |err| {
+            print("Failed to allocate memory for path buffer: {s}\n", .{@errorName(err)});
+            continue;
+        };
         defer allocator.free(full_path);
 
         const file = dir.openFile(io, entry.path, .{ .mode = .read_only }) catch |err| {
@@ -51,14 +80,22 @@ pub fn walkDir(
         };
         defer file.close(io);
 
-        try searchFile(allocator, io, stdout, file, full_path, pattern, options);
+        const match = searchFile(allocator, io, w, file, full_path, pattern, options);
+        if (any_match == false and match == true) any_match = true;
     }
+
+    return any_match;
 }
 
 // hello -> comment is for testing do not remove
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) u8 {
     const io = init.io;
-    const stdout = std.Io.File.stdout();
+
+    var out_buf: [4096]u8 = undefined;
+    var fw = std.Io.File.stdout().writer(io, &out_buf);
+    const w = &fw.interface;
+
+    var any_match: bool = false;
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -67,7 +104,14 @@ pub fn main(init: std.process.Init) !void {
     var options: zrep.Options = .{};
     var pattern: ?[]const u8 = null;
 
-    const args = try init.minimal.args.toSlice(allocator);
+    const args = init.minimal.args.toSlice(allocator) catch |err| {
+        print("Error allocating memory for args: ", .{});
+        switch (err) {
+            error.OutOfMemory => print("Out of memory\n", .{}),
+            error.Unexpected => print("Unexpected error\n", .{}),
+        }
+        return 1;
+    };
 
     // size is know becuase of arg.len so I could allocated fixed mem here
     var files: std.ArrayList([:0]const u8) = .empty;
@@ -89,8 +133,10 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (arg.len > 1 and std.mem.startsWith(u8, arg, "-")) {
-            try zrep.parseFlag(args, arg, &param_indexes, i, &options);
-            continue;
+            const parsed = zrep.parseFlag(args, arg, &param_indexes, i, &options);
+            if (parsed) {
+                continue;
+            } else return 1;
         }
 
         if (pattern == null) {
@@ -98,38 +144,82 @@ pub fn main(init: std.process.Init) !void {
             continue;
         }
 
-        try paths.append(allocator, arg);
+        paths.append(allocator, arg) catch |err| {
+            print("Error storing filepaths for search: {t}\n", .{err});
+            return 1;
+        };
     }
     options.show_filenames = paths.items.len > 1 or options.recursive;
 
-    const pat = pattern orelse return error.InvalidArguments;
+    const pat = pattern orelse {
+        print("No search pattern provided: {t}\n", .{error.InvalidArguments});
+        return 1;
+    };
+
+    // try to read from stdin if no files, allows for cat foo | zrep help
+    if (paths.items.len == 0 and !options.recursive) {
+        _ = searchFile(allocator, io, w, std.Io.File.stdin(), "(standard input)", pat, options);
+        return 0;
+    }
 
     // find matches
     for (paths.items) |item| {
+        var match = false;
         const file = std.Io.Dir.cwd().openFile(io, item, .{ .mode = .read_only }) catch |err| {
             switch (err) {
                 error.FileNotFound => print("{s}: no such file\n", .{item}),
                 else => print("{s}: {s}\n", .{ item, @errorName(err) }),
             }
-            return;
+            continue;
         };
         defer file.close(io);
 
-        const meta = try file.stat(io);
+        const meta = file.stat(io) catch |err| {
+            print("Error checking type of paramater {s}: ", .{item});
+            switch (err) {
+                error.AccessDenied => print("Access denied\n", .{}),
+                error.Canceled => print("Operation cancelled\n", .{}),
+                error.PermissionDenied => print("Permission denied\n", .{}),
+                error.Unexpected => print("Unexpected error\n", .{}),
+                error.SystemResources => print("System resources\n", .{}),
+                error.Streaming => print("Input is stream\n", .{}),
+            }
+            return 1;
+        };
 
         switch (meta.kind) {
-            .file => try searchFile(allocator, io, stdout, file, item, pat, options),
+            .file => {
+                match = searchFile(allocator, io, w, file, item, pat, options);
+                if (any_match == false and match == true) any_match = true;
+                w.flush() catch |err| {
+                    print("Error: {t}\n", .{err});
+                    return 1;
+                };
+            },
             .directory => {
                 if (!options.recursive) {
                     print("Error: {s} is not a file. Use -r flag to scan directories\n", .{item});
                     break;
                 }
-                try walkDir(io, stdout, allocator, item, pat, options);
+                match = walkDir(io, w, allocator, item, pat, options);
+                if (any_match == false and match == true) any_match = true;
+
+                w.flush() catch |err| {
+                    print("Error: {t}\n", .{err});
+                    return 1;
+                };
+                continue;
             },
-            .sym_link => print("File {s} is symbolic link\n", .{item}),
+            .sym_link => {
+                print("File {s} is symbolic link\n", .{item});
+                continue;
+            },
             else => {
                 print("{s} is neither file nor directory\n", .{item});
+                continue;
             },
         }
     }
+
+    return 0;
 }
