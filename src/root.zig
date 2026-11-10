@@ -12,6 +12,8 @@ pub const Options = struct {
     before_context: usize = 0,
 };
 
+pub const RingBufError = error{OutOfMemory};
+
 pub const RingBuf = struct {
     allocator: std.mem.Allocator,
     items: []std.ArrayList(u8),
@@ -19,8 +21,8 @@ pub const RingBuf = struct {
     start: usize = 0,
     cap: usize = 0,
 
-    pub fn init(allocator: std.mem.Allocator, capacity: usize) !@This() {
-        const items = try allocator.alloc(std.ArrayList(u8), capacity);
+    pub fn init(allocator: std.mem.Allocator, capacity: usize) RingBufError!@This() {
+        const items = allocator.alloc(std.ArrayList(u8), capacity) catch |err| return err;
         for (items) |*slot| slot.* = .empty;
 
         return .{
@@ -38,14 +40,20 @@ pub const RingBuf = struct {
     }
 };
 
-// TODO: add tests for this function
+pub const ParseError = error{
+    MissingValue,
+    InvalidContext,
+    InvalidOption,
+    OutOfMemory,
+};
+
 pub fn parseFlag(
     args: []const [:0]const u8,
     arg: [:0]const u8,
     param_indexes: *std.AutoHashMap(usize, void),
     i: usize,
     options: *Options,
-) bool {
+) ParseError!void {
     for (arg[1..]) |flag| {
         switch (flag) {
             'c' => {
@@ -59,61 +67,22 @@ pub fn parseFlag(
             'i' => options.ignore_case = true,
             'l' => options.line_numbers = true,
             'v' => options.invert = true,
-            'A' => {
+            'A', 'B' => {
                 if (args.len <= (i + 1)) {
-                    print("Missing value for context after flag: -A\n", .{});
-                    return false;
+                    return error.MissingValue;
                 }
 
-                const context_size = std.fmt.parseInt(usize, args[i + 1], 10) catch |err| {
-                    print("Error parsing context size integer {s}: ", .{args[i + 1]});
-                    switch (err) {
-                        error.Overflow => print("Integer overflow error\n", .{}),
-                        error.InvalidCharacter => print("Invalid character\n", .{}),
-                    }
-                    return false;
-                };
-                param_indexes.put(i + 1, {}) catch |err| {
-                    print("Error storing buffer context: ", .{});
-                    switch (err) {
-                        error.OutOfMemory => print("Out of memory\n", .{}),
-                    }
-                    return false;
-                };
+                const context_size = std.fmt.parseInt(usize, args[i + 1], 10) catch return error.InvalidContext;
+                param_indexes.put(i + 1, {}) catch return error.OutOfMemory;
 
                 // silently kill context window if count flag detected
-                if (!options.count) options.after_context = context_size;
-            },
-            'B' => {
-                if (args.len <= (i + 1)) {
-                    print("Missing value for context after flag: -B\n", .{});
-                    return false;
+                if (!options.count) {
+                    if (flag == 'A') options.after_context = context_size else options.before_context = context_size;
                 }
-
-                const context_size = std.fmt.parseInt(usize, args[i + 1], 10) catch |err| {
-                    print("Error parsing context size integer {s}: ", .{args[i + 1]});
-                    switch (err) {
-                        error.Overflow => print("Integer overflow error\n", .{}),
-                        error.InvalidCharacter => print("Invalid character\n", .{}),
-                    }
-                    return false;
-                };
-                param_indexes.put(i + 1, {}) catch |err| {
-                    print("Error storing buffer context: ", .{});
-                    switch (err) {
-                        error.OutOfMemory => print("Out of memory\n", .{}),
-                    }
-                    return false;
-                };
-
-                // silently kill context window if count flag detected
-                if (!options.count) options.before_context = context_size;
             },
-            else => {},
+            else => return error.InvalidOption,
         }
     }
-
-    return true;
 }
 
 /// Pure logic: no I/O, trivially testable.
@@ -125,6 +94,14 @@ pub fn lineMatches(line: []const u8, pattern: []const u8, opts: Options) bool {
     return found != opts.invert;
 }
 
+pub const SearchError = error{
+    WriteFailed,
+    OutOfMemory,
+    ReadFailed,
+    StreamTooLong,
+    NoSpaceLeft,
+};
+
 pub fn write(
     w: *std.Io.Writer,
     str: []const u8,
@@ -132,20 +109,14 @@ pub fn write(
     last_printed_line: usize,
     line_num: usize,
     opts: Options,
-) usize {
+) SearchError!usize {
     if ((opts.before_context > 0 or opts.after_context > 0) and line_num <= last_printed_line)
         return last_printed_line;
 
-    _ = w.writeAll(str) catch |err| {
-        print("Error writing with {s}\n", .{@errorName(err)});
-        return 0;
-    };
+    _ = w.writeAll(str) catch return error.WriteFailed;
 
     if (new_line) {
-        _ = w.writeAll("\n") catch |err| {
-            print("Error writing {s}\n", .{@errorName(err)});
-            return 0;
-        };
+        _ = w.writeAll("\n") catch return error.WriteFailed;
     }
 
     return line_num;
@@ -157,7 +128,7 @@ pub fn countMatches(
     path: []const u8,
     pattern: []const u8,
     opts: Options,
-) !bool {
+) SearchError!bool {
     var line_num: usize = 0;
     var matches: usize = 0;
 
@@ -173,10 +144,7 @@ pub fn countMatches(
     else
         try std.fmt.bufPrint(&out, "{d}\n", .{matches});
 
-    _ = w.writeAll(str) catch |err| {
-        print("Error: {s}\n", .{@errorName(err)});
-        return false;
-    };
+    _ = w.writeAll(str) catch |err| return err;
     return matches > 0;
 }
 
@@ -188,7 +156,7 @@ pub fn searchStream(
     path: []const u8,
     pattern: []const u8,
     opts: Options,
-) !bool {
+) SearchError!bool {
     var line_num: usize = 0;
     var last_printed_line: usize = 0;
     var printed_header = false;
@@ -197,7 +165,7 @@ pub fn searchStream(
     var matched: bool = false;
     var printed_a_context: usize = 0;
 
-    var ring = try RingBuf.init(allocator, opts.before_context);
+    var ring = RingBuf.init(allocator, opts.before_context) catch |err| return err;
     defer ring.deinit();
 
     while (try r.takeDelimiter('\n')) |line| {
@@ -216,7 +184,7 @@ pub fn searchStream(
                 try std.fmt.bufPrint(&out, "{d}:{s}\n", .{ line_num, line })
             else
                 try std.fmt.bufPrint(&out, "{s}\n", .{line});
-            last_printed_line = write(w, str, false, last_printed_line, line_num, opts);
+            last_printed_line = write(w, str, false, last_printed_line, line_num, opts) catch |err| return err;
         }
 
         if (!lineMatches(line, pattern, opts)) {
@@ -241,7 +209,7 @@ pub fn searchStream(
 
         // write file name
         if (!printed_header) {
-            _ = write(w, path, true, last_printed_line, line_num, opts);
+            _ = write(w, path, true, last_printed_line, line_num, opts) catch |err| return err;
             printed_header = true;
         }
 
@@ -260,10 +228,10 @@ pub fn searchStream(
 
                 if (opts.line_numbers) {
                     const str = try std.fmt.bufPrint(&num, "{d}:", .{prev_line_num});
-                    _ = write(w, str, false, last_printed_line, prev_line_num, opts);
+                    _ = write(w, str, false, last_printed_line, prev_line_num, opts) catch |err| return err;
                 }
 
-                _ = write(w, ring_line, true, last_printed_line, prev_line_num, opts);
+                _ = write(w, ring_line, true, last_printed_line, prev_line_num, opts) catch |err| return err;
             }
         }
 
@@ -273,116 +241,278 @@ pub fn searchStream(
                 try std.fmt.bufPrint(&out, "{d}:{s}\n", .{ line_num, line })
             else
                 try std.fmt.bufPrint(&out, "{s}\n", .{line});
-            last_printed_line = write(w, str, false, last_printed_line, line_num, opts);
+            last_printed_line = write(w, str, false, last_printed_line, line_num, opts) catch |err| return err;
         }
     }
 
     return matches > 0;
 }
 
+const testing = std.testing;
+
 test "lineMatches: literal, ignore case, invert" {
-    try std.testing.expect(lineMatches("hello world", "world", .{}));
-    try std.testing.expect(!lineMatches("hello world", "WORLD", .{}));
-    try std.testing.expect(lineMatches("hello world", "WORLD", .{ .ignore_case = true }));
-    try std.testing.expect(!lineMatches("hello world", "world", .{ .invert = true }));
-    try std.testing.expect(lineMatches("hello world", "xyz", .{ .invert = true }));
+    try testing.expect(lineMatches("hello world", "world", .{}));
+    try testing.expect(!lineMatches("hello world", "WORLD", .{}));
+    try testing.expect(lineMatches("hello world", "WORLD", .{ .ignore_case = true }));
+    try testing.expect(!lineMatches("hello world", "world", .{ .invert = true }));
+    try testing.expect(lineMatches("hello world", "xyz", .{ .invert = true }));
 }
 
-const TestSink = struct {
-    list: *std.Io.Writer.Allocating,
-
-    pub fn writeStreamingAll(self: TestSink, io: std.Io, bytes: []const u8) !void {
-        _ = io;
-        try self.list.writer.writeAll(bytes);
-    }
-};
-
 test "searchStream prints header and numbered matches" {
-    const allocator = std.testing.allocator;
+    const allocator = testing.allocator;
     var r = std.Io.Reader.fixed("alpha\nbeta\nalphabet\n");
-    var out = std.Io.Writer.Allocating.init(allocator);
-    defer out.deinit();
 
-    const matched = try searchStream(allocator, &r, TestSink{ .list = &out }, std.testing.io, "f.txt", "alpha", .{ .line_numbers = true });
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
 
-    try std.testing.expect(matched);
-    try std.testing.expectEqualStrings("f.txt\n1:alpha\n3:alphabet\n", out.written());
+    const matched = try searchStream(allocator, &r, &aw.writer, "f.txt", "alpha", .{ .line_numbers = true });
+    try testing.expect(matched);
+    try testing.expectEqualStrings("f.txt\n1:alpha\n3:alphabet\n", aw.written());
 }
 
 test "countMatches (-c) prints only the count" {
-    const allocator = std.testing.allocator;
     var r = std.Io.Reader.fixed("a\nb\na\n");
-    var out = std.Io.Writer.Allocating.init(allocator);
-    defer out.deinit();
 
-    const matched = try countMatches(&r, TestSink{ .list = &out }, std.testing.io, "f.txt", "a", .{ .count = true });
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
 
-    try std.testing.expect(matched);
-    try std.testing.expectEqualStrings("2\n", out.written());
+    const matched = try countMatches(&r, &aw.writer, "f.txt", "a", .{ .count = true });
+
+    try testing.expect(matched);
+    try testing.expectEqualStrings("2\n", aw.written());
 }
 
 test "searchStream -v selects non-matching lines" {
-    const allocator = std.testing.allocator;
+    const allocator = testing.allocator;
     var r = std.Io.Reader.fixed("a\nb\na\n");
-    var out = std.Io.Writer.Allocating.init(allocator);
-    defer out.deinit();
 
-    _ = try searchStream(allocator, &r, TestSink{ .list = &out }, std.testing.io, "f.txt", "a", .{ .invert = true });
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
 
-    try std.testing.expectEqualStrings("f.txt\nb\n", out.written());
+    _ = try searchStream(allocator, &r, &aw.writer, "f.txt", "a", .{ .invert = true });
+
+    try testing.expectEqualStrings("f.txt\nb\n", aw.written());
 }
 
 test "searchStream reports no match" {
-    const allocator = std.testing.allocator;
+    const allocator = testing.allocator;
     var r = std.Io.Reader.fixed("a\nb\n");
-    var out = std.Io.Writer.Allocating.init(allocator);
-    defer out.deinit();
 
-    const matched = try searchStream(allocator, &r, TestSink{ .list = &out }, std.testing.io, "f.txt", "zzz", .{});
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
 
-    try std.testing.expect(!matched);
-    try std.testing.expectEqualStrings("", out.written());
+    const matched = try searchStream(allocator, &r, &aw.writer, "f.txt", "zzz", .{});
+
+    try testing.expect(!matched);
+    try testing.expectEqualStrings("", aw.written());
 }
 
 test "searchStream -B stays in bounds" {
-    const allocator = std.testing.allocator;
+    const allocator = testing.allocator;
     var r = std.Io.Reader.fixed("a\ntest\nb\nc\n");
-    var out = std.Io.Writer.Allocating.init(allocator);
-    defer out.deinit();
 
-    const matched = try searchStream(allocator, &r, TestSink{ .list = &out }, std.testing.io, "f.txt", "test", .{ .before_context = 5 });
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
 
-    try std.testing.expect(matched);
-    try std.testing.expectEqualStrings("f.txt\na\ntest\n", out.written());
+    const matched = try searchStream(allocator, &r, &aw.writer, "f.txt", "test", .{ .before_context = 5 });
+
+    try testing.expect(matched);
+    try testing.expectEqualStrings("f.txt\na\ntest\n", aw.written());
 }
 
 test "searchStream -B overlapping context prints each line once" {
-    const allocator = std.testing.allocator;
+    const allocator = testing.allocator;
     var r = std.Io.Reader.fixed("a\nhit\nb\nhit\nc\n");
-    var out = std.Io.Writer.Allocating.init(allocator);
-    defer out.deinit();
 
-    const matched = try searchStream(allocator, &r, TestSink{ .list = &out }, std.testing.io, "f.txt", "hit", .{
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    const matched = try searchStream(allocator, &r, &aw.writer, "f.txt", "hit", .{
         .line_numbers = true,
         .before_context = 2,
     });
 
-    try std.testing.expect(matched);
-    try std.testing.expectEqualStrings("f.txt\n1:a\n2:hit\n3:b\n4:hit\n", out.written());
+    try testing.expect(matched);
+    try testing.expectEqualStrings("f.txt\n1:a\n2:hit\n3:b\n4:hit\n", aw.written());
 }
 
 test "test searchStream -B and -A overlapping context prints each line once" {
-    const allocator = std.testing.allocator;
+    const allocator = testing.allocator;
     var r = std.Io.Reader.fixed("a\nhit\nb\nhit\nhit\nc\nnoshow\n");
-    var out = std.Io.Writer.Allocating.init(allocator);
-    defer out.deinit();
 
-    const matched = try searchStream(allocator, &r, TestSink{ .list = &out }, std.testing.io, "f.txt", "hit", .{
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    const matched = try searchStream(allocator, &r, &aw.writer, "f.txt", "hit", .{
         .line_numbers = true,
         .before_context = 2,
         .after_context = 1,
     });
 
-    try std.testing.expect(matched);
-    try std.testing.expectEqualStrings("f.txt\n1:a\n2:hit\n3:b\n4:hit\n5:hit\n6:c\n", out.written());
+    try testing.expect(matched);
+    try testing.expectEqualStrings("f.txt\n1:a\n2:hit\n3:b\n4:hit\n5:hit\n6:c\n", aw.written());
+}
+
+// Most tests don't inspect param_indexes, so this hides the boilerplate.
+fn parse(args: []const [:0]const u8, i: usize, options: *Options) ParseError!void {
+    var param_indexes = std.AutoHashMap(usize, void).init(testing.allocator);
+    defer param_indexes.deinit();
+    try parseFlag(args, args[i], &param_indexes, i, options);
+}
+
+test "parseFlag: single boolean flags" {
+    const args = [_][:0]const u8{ "zrep", "-r", "pat" };
+    var opts: Options = .{};
+    try parse(&args, 1, &opts);
+    try testing.expect(opts.recursive);
+    try testing.expect(!opts.ignore_case);
+    try testing.expect(!opts.invert);
+    try testing.expect(!opts.line_numbers);
+    try testing.expect(!opts.count);
+}
+
+test "parseFlag: combined boolean flags" {
+    const args = [_][:0]const u8{ "zrep", "-rilv", "pat" };
+    var opts: Options = .{};
+    try parse(&args, 1, &opts);
+    try testing.expect(opts.recursive);
+    try testing.expect(opts.ignore_case);
+    try testing.expect(opts.line_numbers);
+    try testing.expect(opts.invert);
+    try testing.expect(!opts.count);
+}
+
+test "parseFlag: lone dash is a no-op" {
+    const args = [_][:0]const u8{ "zrep", "-", "pat" };
+    var opts: Options = .{};
+    try parse(&args, 1, &opts);
+    try testing.expect(!opts.recursive);
+    try testing.expect(!opts.count);
+}
+
+test "parseFlag: -A sets after_context and records the value index" {
+    const args = [_][:0]const u8{ "zrep", "-A", "3", "pat" };
+    var opts: Options = .{};
+    var pi = std.AutoHashMap(usize, void).init(testing.allocator);
+    defer pi.deinit();
+
+    try parseFlag(&args, args[1], &pi, 1, &opts);
+    try testing.expectEqual(@as(usize, 3), opts.after_context);
+    try testing.expectEqual(@as(usize, 0), opts.before_context);
+    try testing.expect(pi.contains(2));
+    try testing.expectEqual(@as(u32, 1), pi.count());
+}
+
+test "parseFlag: -B sets before_context and records the value index" {
+    const args = [_][:0]const u8{ "zrep", "-B", "4", "pat" };
+    var opts: Options = .{};
+    var pi = std.AutoHashMap(usize, void).init(testing.allocator);
+    defer pi.deinit();
+
+    try parseFlag(&args, args[1], &pi, 1, &opts);
+    try testing.expectEqual(@as(usize, 4), opts.before_context);
+    try testing.expectEqual(@as(usize, 0), opts.after_context);
+    try testing.expect(pi.contains(2));
+    try testing.expectEqual(@as(u32, 1), pi.count());
+}
+
+test "parseFlag: -A and -B work when combined with boolean flags" {
+    const args = [_][:0]const u8{ "zrep", "-iA", "2", "pat" };
+    var opts: Options = .{};
+    try parse(&args, 1, &opts);
+    try testing.expect(opts.ignore_case);
+    try testing.expectEqual(@as(usize, 2), opts.after_context);
+}
+
+test "parseFlag: -A missing value" {
+    // flag is the last arg
+    const args = [_][:0]const u8{ "zrep", "pat", "-A" };
+    var opts: Options = .{};
+    try testing.expectError(error.MissingValue, parse(&args, 2, &opts));
+    try testing.expectEqual(@as(usize, 0), opts.after_context);
+}
+
+test "parseFlag: -B missing value" {
+    const args = [_][:0]const u8{ "zrep", "pat", "-B" };
+    var opts: Options = .{};
+    try testing.expectError(error.MissingValue, parse(&args, 2, &opts));
+    try testing.expectEqual(@as(usize, 0), opts.before_context);
+}
+
+test "parseFlag: non-numeric context value" {
+    const args = [_][:0]const u8{ "zrep", "-A", "abc", "pat" };
+    var opts: Options = .{};
+    var pi = std.AutoHashMap(usize, void).init(testing.allocator);
+    defer pi.deinit();
+
+    try testing.expectError(error.InvalidContext, parseFlag(&args, args[1], &pi, 1, &opts));
+    try testing.expectEqual(@as(usize, 0), opts.after_context);
+    try testing.expectEqual(@as(u32, 0), pi.count()); // nothing recorded on failure
+}
+
+test "parseFlag: negative context value is rejected" {
+    const args = [_][:0]const u8{ "zrep", "-B", "-1", "pat" };
+    var opts: Options = .{};
+    try testing.expectError(error.InvalidContext, parse(&args, 1, &opts));
+}
+
+test "parseFlag: overflowing context value is rejected" {
+    const args = [_][:0]const u8{ "zrep", "-A", "99999999999999999999999999", "pat" };
+    var opts: Options = .{};
+    try testing.expectError(error.InvalidContext, parse(&args, 1, &opts));
+}
+
+test "parseFlag: -c clears previously set context" {
+    const args = [_][:0]const u8{ "zrep", "-c", "pat" };
+    var opts: Options = .{ .after_context = 3, .before_context = 5 };
+    try parse(&args, 1, &opts);
+    try testing.expect(opts.count);
+    try testing.expectEqual(@as(usize, 0), opts.after_context);
+    try testing.expectEqual(@as(usize, 0), opts.before_context);
+}
+
+test "parseFlag: -c before -A in a cluster wins" {
+    const args = [_][:0]const u8{ "zrep", "-cA", "3", "pat" };
+    var opts: Options = .{};
+    var pi = std.AutoHashMap(usize, void).init(testing.allocator);
+    defer pi.deinit();
+
+    try parseFlag(&args, args[1], &pi, 1, &opts);
+    try testing.expect(opts.count);
+    try testing.expectEqual(@as(usize, 0), opts.after_context);
+    try testing.expect(pi.contains(2)); // value is still consumed
+}
+
+test "parseFlag: -c after -A in a cluster wins" {
+    const args = [_][:0]const u8{ "zrep", "-Ac", "3", "pat" };
+    var opts: Options = .{};
+    try parse(&args, 1, &opts);
+    try testing.expect(opts.count);
+    try testing.expectEqual(@as(usize, 0), opts.after_context);
+}
+
+test "parseFlag: invalid option returns invalid option error" {
+    const args = [_][:0]const u8{ "zrep", "-z", "pat" };
+    var opts: Options = .{};
+    try testing.expectError(error.InvalidOption, parse(&args, 1, &opts));
+}
+
+test "parseFlag: flags before an invalid one are still applied" {
+    // Documents current behavior: options are mutated as the loop goes,
+    // so a failure partway through leaves earlier flags set.
+    const args = [_][:0]const u8{ "zrep", "-rz", "pat" };
+    var opts: Options = .{};
+    try testing.expectError(error.InvalidOption, parse(&args, 1, &opts));
+    try testing.expect(opts.recursive);
+}
+
+test "parseFlag: out of memory storing param index" {
+    const args = [_][:0]const u8{ "zrep", "-A", "3", "pat" };
+    var opts: Options = .{};
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var pi = std.AutoHashMap(usize, void).init(failing.allocator());
+    defer pi.deinit();
+
+    try testing.expectError(error.OutOfMemory, parseFlag(&args, args[1], &pi, 1, &opts));
+    try testing.expectEqual(@as(usize, 0), opts.after_context);
 }

@@ -2,6 +2,16 @@ const std = @import("std");
 const zrep = @import("zrep");
 const print = std.debug.print;
 
+pub fn catchSearchErrors(err: zrep.SearchError) void {
+    switch (err) {
+        error.WriteFailed => print("Error writing: {s}\n", .{@errorName(err)}),
+        error.NoSpaceLeft => print("Error: no space left to fit incoming stream\n", .{}),
+        error.OutOfMemory => print("Error: out of memory\n", .{}),
+        error.ReadFailed => print("Error: incoming read stream failed\n", .{}),
+        error.StreamTooLong => print("Error: incoming stream too long to read\n", .{}),
+    }
+}
+
 pub fn searchFile(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -18,14 +28,14 @@ pub fn searchFile(
 
     if (opts.count) {
         match = zrep.countMatches(r, w, item, pattern, opts) catch |err| {
-            print("Error counting matches: {t}\n", .{err});
+            catchSearchErrors(err);
             return match;
         };
         return match;
     }
 
     match = zrep.searchStream(allocator, r, w, item, pattern, opts) catch |err| {
-        print("Error searching files: {t}\n", .{err});
+        catchSearchErrors(err);
         return match;
     };
     return match;
@@ -88,7 +98,7 @@ pub fn walkDir(
 }
 
 // hello -> comment is for testing do not remove
-pub fn main(init: std.process.Init) u8 {
+pub fn main(init: std.process.Init) void {
     const io = init.io;
 
     var out_buf: [4096]u8 = undefined;
@@ -110,7 +120,7 @@ pub fn main(init: std.process.Init) u8 {
             error.OutOfMemory => print("Out of memory\n", .{}),
             error.Unexpected => print("Unexpected error\n", .{}),
         }
-        return 1;
+        std.process.exit(2);
     };
 
     // size is know becuase of arg.len so I could allocated fixed mem here
@@ -133,10 +143,16 @@ pub fn main(init: std.process.Init) u8 {
         }
 
         if (arg.len > 1 and std.mem.startsWith(u8, arg, "-")) {
-            const parsed = zrep.parseFlag(args, arg, &param_indexes, i, &options);
-            if (parsed) {
-                continue;
-            } else return 1;
+            zrep.parseFlag(args, arg, &param_indexes, i, &options) catch |err| {
+                switch (err) {
+                    error.InvalidContext => print("Error parsing context size integer {s}: ", .{args[i + 1]}),
+                    error.InvalidOption => print("invalid option: {s}\nusage: zrep [-cilrv] [-A num] [-B num]\n[pattern] [file]\n", .{args[i]}),
+                    error.MissingValue => print("Missing value for context after flag: -A\n", .{}),
+                    error.OutOfMemory => print("Error storing buffer context: ", .{}),
+                }
+                std.process.exit(2);
+            };
+            continue;
         }
 
         if (pattern == null) {
@@ -146,20 +162,20 @@ pub fn main(init: std.process.Init) u8 {
 
         paths.append(allocator, arg) catch |err| {
             print("Error storing filepaths for search: {t}\n", .{err});
-            return 1;
+            std.process.exit(2);
         };
     }
     options.show_filenames = paths.items.len > 1 or options.recursive;
 
     const pat = pattern orelse {
         print("No search pattern provided: {t}\n", .{error.InvalidArguments});
-        return 1;
+        std.process.exit(2);
     };
 
     // try to read from stdin if no files, allows for cat foo | zrep help
     if (paths.items.len == 0 and !options.recursive) {
-        _ = searchFile(allocator, io, w, std.Io.File.stdin(), "(standard input)", pat, options);
-        return 0;
+        any_match = searchFile(allocator, io, w, std.Io.File.stdin(), "(standard input)", pat, options);
+        if (any_match) std.process.exit(0) else std.process.exit(1);
     }
 
     // find matches
@@ -184,7 +200,7 @@ pub fn main(init: std.process.Init) u8 {
                 error.SystemResources => print("System resources\n", .{}),
                 error.Streaming => print("Input is stream\n", .{}),
             }
-            return 1;
+            std.process.exit(2);
         };
 
         switch (meta.kind) {
@@ -193,7 +209,7 @@ pub fn main(init: std.process.Init) u8 {
                 if (any_match == false and match == true) any_match = true;
                 w.flush() catch |err| {
                     print("Error: {t}\n", .{err});
-                    return 1;
+                    std.process.exit(2);
                 };
             },
             .directory => {
@@ -206,7 +222,7 @@ pub fn main(init: std.process.Init) u8 {
 
                 w.flush() catch |err| {
                     print("Error: {t}\n", .{err});
-                    return 1;
+                    std.process.exit(2);
                 };
                 continue;
             },
@@ -221,5 +237,5 @@ pub fn main(init: std.process.Init) u8 {
         }
     }
 
-    return 0;
+    if (any_match) return std.process.exit(0) else return std.process.exit(1);
 }
